@@ -1,0 +1,475 @@
+---
+title: "PCoA y LDA de todos los proyectos"
+output: html_document
+date: "2025-08-06"
+---
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(reshape2)
+library(gridExtra)
+library(tidyverse)
+library(ape)
+library(magrittr)
+library(data.table)
+library(ecodist)
+library(MASS)
+library(caret)
+library(patchwork)  
+
+my_path<-"/Users/sofioiene/Desktop/double_zero-main/"
+setwd(my_path)
+```
+
+# Carga de datos en dos listas
+
+```{r}
+load(paste0(my_path, "asv_tables_with_metadata/all_projects.rda"))  
+
+# crea en el entorno 'original_list' y 'manifest_list'
+```
+
+Generacion de manifest_list y original_list
+(conviene cargar el rda de arriba!)
+
+```{}
+
+dir_path <- file.path(my_path, "asv_tables_with_metadata")
+
+# 1) Armar vector de proyectos (máximo 16)
+allfiles <- list.files(dir_path, pattern = "\\.tsv$", full.names = FALSE)
+base_names <- gsub("_(OTUtable|Metadata)\\.tsv$", "", allfiles)
+allprojects <- unique(base_names)
+
+# 2) Preparar listas nombradas
+original_list <- setNames(vector("list", length(allprojects)), allprojects)
+manifest_list <- setNames(vector("list", length(allprojects)), allprojects)
+
+# 3) Cargar cada proyecto
+for (p in allprojects) {
+  cat("Cargando proyecto:", p, "...\n")
+
+  otu_file <- file.path(dir_path, paste0(p, "_OTUtable.tsv"))
+  md_file  <- file.path(dir_path, paste0(p, "_Metadata.tsv"))
+
+  # --- ORIGINAL (OTU table)
+  original <- read.table(
+    otu_file, header = TRUE, check.names = FALSE, sep = "\t", row.names = 1
+  )
+  original$`OTU ID` <- rownames(original)
+
+  # Convertir a numéricas todas las columnas salvo 'OTU ID'
+  sample_cols <- setdiff(names(original), "OTU ID")
+  original[sample_cols] <- lapply(original[sample_cols], function(x) {
+    suppressWarnings(as.numeric(x))
+  })
+
+  original_list[[p]] <- original
+
+  # --- MANIFEST
+  manifest <- read_tsv(
+    md_file,
+    col_names = TRUE,
+    comment = "",
+    locale = locale(encoding = "UTF-8"),
+    name_repair = "minimal",
+    show_col_types = FALSE
+  )
+
+  manifest_list[[p]] <- manifest
+}
+
+# --- Ejemplos de uso:
+# names(original_list)
+# names(manifest_list)
+# head(original_list[[ allprojects[1] ]])
+# head(manifest_list[[ allprojects[1] ]])
+```
+
+# Cálculo con PCoa con bray-curtis
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+
+#myproject<-allprojects[14]
+
+plot_list <- list()
+
+for(myproject in names(original_list)) {
+
+print(myproject)
+
+original <- original_list[[ myproject ]]
+#original$`OTU ID`<-rownames(original)
+manifest <- manifest_list[[ myproject ]]
+
+prue<-as.data.frame(original)
+rownames(prue)<-original$`OTU ID`
+prue<-prue[,!colnames(prue)%in%c("OTU ID")]
+prue <- as.data.frame(lapply(prue, as.numeric))
+
+manifest$sample.id <- gsub("-", ".", manifest$"sample.id")
+
+# Transponer y calcular la matriz de distancias Bray-Curtis
+bray_curtis_dist <- vegan::vegdist(t(prue), method = "bray")
+
+# Realizar PCoA
+bray_curtis_pcoa <- ecodist::pco(bray_curtis_dist)
+
+# Coordenadas de las muestras (pacientes)
+sample_scores <- data.frame(
+  pcoa1 = bray_curtis_pcoa$vectors[, 1], 
+  pcoa2 = bray_curtis_pcoa$vectors[, 2]
+)
+rownames(sample_scores) <- rownames(bray_curtis_pcoa$vectors)
+
+sample_scores$color <- as.factor(manifest$group[match(rownames(sample_scores), manifest$sample.id)])
+
+# cálculo de las coordenadas de los taxones: 
+
+# Transponer prue para que OTUs estén en columnas, muestras en filas
+otu_matrix <- t(prue)
+
+otu_scores <- apply(otu_matrix, 2, function(x) {
+  c(cor(x, sample_scores$pcoa1, use = "pairwise.complete.obs"),
+    cor(x, sample_scores$pcoa2, use = "pairwise.complete.obs"))
+})
+otu_scores <- as.data.frame(t(otu_scores))
+colnames(otu_scores) <- c("Axis.1", "Axis.2")
+otu_scores$OTU <- rownames(otu_scores)
+
+# Calcular la longitud de las flechas
+otu_scores$length <- sqrt(otu_scores$Axis.1^2 + otu_scores$Axis.2^2)
+
+# Nos quedamos con las 10 coords más representativas
+top_otus <- otu_scores %>% 
+  top_n(10, wt = length)
+
+# Cálculo de varianza explicada
+eigenvalues <- bray_curtis_pcoa$values
+variance_explained <- (eigenvalues / sum(eigenvalues)) * 100
+pc1_var <- round(variance_explained[1], 2)
+pc2_var <- round(variance_explained[2], 2)
+
+# Crear el biplot
+biplot_pcoa <- ggplot() +
+  geom_point(data = sample_scores, aes(x = pcoa1, y = pcoa2, color = color), size = 3) +
+  labs(
+    x = paste0("PC1 (", pc1_var, "%)"),
+    y = paste0("PC2 (", pc2_var, "%)"),
+    title = "PCoA Biplot con distancia de Bray-Curtis",
+    subtitle = paste0("Proyecto: ", myproject), 
+    color = "Condición"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+biplot_pcoa <- biplot_pcoa +
+  geom_segment(data = top_otus,
+               aes(x = 0, y = 0, xend = Axis.1, yend = Axis.2),
+               arrow = arrow(length = unit(0.2, "cm")), 
+               color = "gray40") +
+  geom_text(data = top_otus,
+            aes(x = Axis.1, y = Axis.2, label = OTU),
+            size = 3, vjust = -0.5, color = "black")
+
+plot_list[[myproject]] <- biplot_pcoa  # guardo el plot en la lista
+
+# para grabar el panel de plot en disco: 
+
+# ggsave(
+#   filename = paste0(myproject, "_biplot_pcoa.jpg"),   
+#   plot = biplot_pcoa,             
+#   path = paste0(my_path,"all_PCoA_y_LDA/plotsPCoA/"),
+#   width = 8, height = 6,          
+#   dpi = 300                       
+# )
+
+}
+
+grilla_4x4 <- wrap_plots(plotlist = plot_list, ncol = 4) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+# para grabar el panel de plot en disco: 
+
+  # ggplot2::ggsave(
+  #   filename = paste0(my_path, "all_PCoA_y_LDA/plotsPCoA/all_PCoAs.png"), 
+  #   plot     = grilla_4x4,
+  #   width = 14, height = 9, units = "in", dpi = 150,
+  #   limitsize = FALSE
+  # )
+
+grilla_4x4
+```
+
+Funcion interna para aplicar en el proceso de LDA
+
+```{r, , cache=TRUE}
+to_numeric_except <- function(df, keep_cols = "group") {
+  # asegurar que keep_cols exista(n)
+  keep_cols <- intersect(keep_cols, names(df))
+  # columnas a convertir
+  cols_num <- setdiff(names(df), keep_cols)
+
+  # trim y convertir a numérico (silenciando warnings de coerción)
+  df[cols_num] <- lapply(df[cols_num], function(x) {
+    if (is.character(x)) {
+      suppressWarnings(as.numeric(trimws(x)))
+    } else if (is.factor(x)) {
+      suppressWarnings(as.numeric(trimws(as.character(x))))
+    } else {
+      x
+    }
+  })
+
+  # si existe 'group', dejarlo como factor
+  if ("group" %in% keep_cols) {
+    df[["group"]] <- as.factor(df[["group"]])
+  }
+
+  df
+}
+
+```
+
+Funciones internas para grabar los graficos de LDA en disco: 
+(son dos funciones)
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+
+save_plot_LDA <- function(plot, myproj) {
+
+  # requiere que 'my_path' exista en el entorno
+  if (!exists("my_path", inherits = TRUE))
+    stop("Definí 'my_path' antes de llamar a save_plot_auto().")
+
+  outdir <- file.path(my_path, "all_PCoA_y_LDA/plotsLDA")
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+  # nombre base: título del plot (si hay) + timestamp
+  title <- tryCatch(plot$labels$title, error = function(e) NULL)
+  if (is.null(title) || !nzchar(title)) title <- "plot"
+  
+  jpg_file <- file.path(outdir, paste0(myproj, "_LDA.jpg"))
+  png_file <- file.path(outdir, paste0(myproj, "_LDA.png"))
+
+  ok_jpg <- tryCatch({
+    ggplot2::ggsave(jpg_file, plot = plot,
+                    width = 17, height = 11, units = "in", dpi = 400,
+                    limitsize = FALSE)
+    TRUE
+  }, error = function(e) FALSE)
+  if (ok_jpg) return(invisible(jpg_file))
+
+  ok_png <- tryCatch({
+    ggplot2::ggsave(png_file, plot = plot,
+                    width = 14, height = 9, units = "in", dpi = 150,
+                    limitsize = FALSE)
+    TRUE
+  }, error = function(e) FALSE)
+  if (ok_png) invisible(png_file) else invisible(NA_character_)
+}
+
+
+save_ldahist_safe <- function(x, g, myproject) {
+  # Requiere 'my_path' definido en el entorno
+  if (!exists("my_path", inherits = TRUE))
+    stop("Definí 'my_path' antes de llamar a save_ldahist_safe().")
+
+  outdir <- file.path(my_path, "all_PCoA_y_LDA/plotsLDA")
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+  # Limpieza y checks
+  g <- as.factor(g)
+  cc <- is.finite(x) & !is.na(g)
+  x <- x[cc]; g <- droplevels(g[cc])
+  if (!length(x) || nlevels(g) < 1) {
+    message("Sin datos válidos para ", myproject, " — no se guarda hist.")
+    return(invisible(NA_character_))
+  }
+
+  jpg_file <- file.path(outdir, paste0(myproject, "_hist.jpg"))
+  png_file <- file.path(outdir, paste0(myproject, "_hist.png"))
+
+  close_if_open <- function() {
+    if (!is.null(dev.list())) try(dev.off(), silent = TRUE)
+  }
+
+  # intento 1: JPG (si falla, NO frena el loop)
+  ok <- try({
+    jpeg(filename = jpg_file, height = 11, width = 17, units = "in", res = 400)
+    par(mfrow = c(1,1), mar = c(4,4,2,1), oma = c(0,0,0,0))
+    MASS::ldahist(x, g = g, main = paste("LD1 -", myproject), xlab = "LD1")
+    dev.off()
+  }, silent = TRUE)
+
+  if (inherits(ok, "try-error")) {
+    message("Falló JPG para ", myproject, " — reintento PNG")
+    close_if_open()
+    try({
+      png(filename = png_file, width = 1400, height = 900, res = 150)
+      par(mfrow = c(1,1), mar = c(4,4,2,1), oma = c(0,0,0,0))
+      MASS::ldahist(x, g = g, main = paste("LD1 -", myproject), xlab = "LD1")
+      dev.off()
+    }, silent = TRUE)
+  }
+
+  # cierre defensivo por si algo quedó abierto
+  close_if_open()
+
+  # devolver la ruta guardada (si existe)
+  if (file.exists(jpg_file)) return(invisible(jpg_file))
+  if (file.exists(png_file)) return(invisible(png_file))
+  invisible(NA_character_)
+}
+
+```
+
+# Cálculo con LDA
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+
+# seteo para guardar los plots de LDA en disco: 
+#outdir <- file.path(my_path, "all_PCoA_y_LDA/plotsLDA")
+#dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+safe_dev_off <- function() {
+  if (!is.null(dev.list())) try(dev.off(), silent = TRUE)
+}
+
+plot_listLDA <- list()
+
+# aca guardamos la tabla con los datos del proceso de LDA
+resumen <- list()
+
+for(myproject in names(original_list)) {
+
+print(myproject)
+
+original <- original_list[[ myproject ]]
+#original$`OTU ID`<-rownames(original)
+manifest <- manifest_list[[ myproject ]]
+
+n_muestras_pre<-dim(manifest)[1]
+n_OTU_pre<-dim(original)[1]
+muestras_por_grupo<- paste(names(table(manifest$group)), table(manifest$group), sep = ": ", collapse = ", ")
+
+prue<-t(as.data.frame(original))
+
+prue_df <- as.data.frame(prue, stringsAsFactors = FALSE)
+prue_df$sample.id <- rownames(prue_df)
+prue_df <-prue_df[!prue_df$sample.id=="OTU ID", ]
+
+prue_df <- prue_df %>%
+  left_join(manifest %>% dplyr::select(sample.id, group), by = "sample.id")
+
+rownames(prue_df) <- prue_df$sample.id
+
+mylda_matrix <- prue_df[, !colnames(prue_df)%in%"sample.id"]
+
+mylda_matrix_num <- to_numeric_except(mylda_matrix, keep_cols = "group")
+
+y <- mylda_matrix_num$group
+X <- mylda_matrix_num %>% dplyr::select(-group)
+
+# 2: Estrategia de eliminacion de taxas si nearZeroVar
+# Ir ajustando nearZeroVar para ver como la cantidad de microbios que van cayendo 
+# con el porcentaje de relajacion/estricto. 
+# Explicacion teorica, analisis de la evolucion del grafico ajustando el nearZero (para ver cuantos microbios pierdo), explicar pq varianza es importante. Despues identificamos microbios considero valiosos segun un nearZero y dsp le hago PCoA con BC.
+
+nzv <- nearZeroVar(X)
+if (length(nzv) > 0) X2 <- X[, -nzv, drop = FALSE] else X2 <- X
+cat("Eliminadas por nearZeroVar:", length(nzv), "variables\n")
+
+elim_nearZeroVar<-length(nzv)
+
+Xsc <- scale(X2)          # centra/escala
+y   <- droplevels(as.factor(y))
+
+n_OTU_post<-dim(Xsc)[2]
+
+taxa.lda <- lda(x = Xsc, grouping = y, tol = 1e-4)  # tol ayuda con casi-singularidad
+
+taxa.lda.values <- predict(taxa.lda)
+
+# save_ldahist_safe(taxa.lda.values$x[, 1], mylda_matrix$group, myproject) # grabar el histograma en el disco
+
+if (!is.null(dev.list())) try(dev.off(), silent = TRUE)
+ 
+  #convert to data frame 
+  newdata <- data.frame(type = mylda_matrix[,"group"], lda = taxa.lda.values$x)
+  newdata$type<-as.factor(newdata$type)
+  
+# Construir data.frame de scores con nombres claros
+scores <- as.data.frame(taxa.lda.values$x)
+
+scores$type <- factor(mylda_matrix_num$group)
+
+n_ASV_post<-dim(scores)[1]
+
+ASV_por_grupo_post<-paste(names(table(scores$type)), table(scores$type), sep = ": ", collapse = ", ")
+  
+resumen[[myproject]] <- data.frame(
+  proyecto = myproject,
+  n_muestras_pre = n_muestras_pre,
+  n_OTU_pre = n_OTU_pre,
+  muestras_por_grupo = muestras_por_grupo,      
+  elim_nearZeroVar = elim_nearZeroVar,
+  n_muestras_post = n_ASV_post,
+  n_OTU_post = n_OTU_post,
+  muestras_por_grupo_post = ASV_por_grupo_post,      
+  stringsAsFactors = FALSE
+)
+
+if (ncol(scores) > 2) {
+  theplot <-ggplot(scores, aes(x = LD1, y = LD2, color = type)) +
+    geom_point(size = 2.5) + ggtitle(myproject, subtitle = "LDA") +
+    stat_ellipse() +
+    scale_color_brewer(palette = "Dark2") +
+    theme_minimal()
+} else {
+   theplot <-ggplot(scores, aes(x = LD1, y = 0, color = type)) +
+     geom_jitter(height = 0.05, size = 2) + ggtitle(myproject, subtitle = "LDA") +
+     scale_color_brewer(palette = "Dark2") +
+     theme_minimal() + labs(y = NULL)
+}
+
+plot_listLDA[[myproject]] <- theplot  # guardo el plot en la lista
+
+# save_plot_LDA(theplot, myproject) # grabar el plot en el disco
+
+}
+
+#Te informa la cantidad de ASVs antes de la estrategia y despues
+tabla_resumen <- dplyr::bind_rows(resumen)
+
+# para guardar la tabla_resumen en disco: 
+
+# write.table(tabla_resumen, file = paste0("/Users/ignaciocassol/Dropbox/research/beta_analysis/all_PCoA_y_LDA/", "resumen_proceso_LDA_all_proys.tsv"),
+#               sep = "\t", row.names = FALSE, quote = FALSE)
+
+
+grilla_4x4LDA <- wrap_plots(plotlist = plot_listLDA, ncol = 4) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+# para guardar el panel de plots de LDA en disco: 
+
+  # ggplot2::ggsave(
+  #   filename = paste0(outdir,"/all_LDAs.png"), 
+  #   plot     = grilla_4x4LDA,
+  #   width = 14, height = 9, units = "in", dpi = 150,
+  #   limitsize = FALSE
+  # )
+
+while (!is.null(dev.list())) try(dev.off(), silent = TRUE)
+grilla_4x4LDA
+
+```
+
+Resumen de haber graficado con LDA
+
+```{r, cache=TRUE}
+tabla_resumen
+```
